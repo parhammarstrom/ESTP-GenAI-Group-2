@@ -53,7 +53,7 @@ api_key = os.getenv("LLM_API_KEY")
 # =========================================================
 
 st.set_page_config(
-    page_title="Travel RAG",
+    page_title="Travel RAG v2",
     page_icon="✈️",
     layout="wide",
 )
@@ -61,12 +61,61 @@ st.set_page_config(
 st.title("✈️ Travel Policy Assistant")
 
 st.caption(
-    "RAG demo using BGE embeddings, FAISS, and Qwen3-8B"
+    "RAG demo with document selection and conflict awareness"
 )
 
+
 # =========================================================
-# Sidebar II
+# Cached resources (models and client only)
 # =========================================================
+
+@st.cache_resource
+def get_embedding_model():
+    return create_embedding_model(embedding_model_name)
+
+
+@st.cache_resource
+def get_llm_client():
+    return create_llm_client(
+        base_url=base_url,
+        api_key=api_key,
+    )
+
+
+# =========================================================
+# Build index for a given set of documents
+# =========================================================
+
+@st.cache_data
+def build_index(selected_docs, chunk_size_val, chunk_overlap_val):
+    documents = []
+    for doc_name in selected_docs:
+        path = documents_directory / doc_name
+        text = path.read_text(encoding="utf-8")
+        documents.append({"source": doc_name, "text": text})
+
+    chunks = create_chunks(
+        documents,
+        chunk_size=chunk_size_val,
+        overlap=chunk_overlap_val,
+    )
+
+    embeddings = create_embeddings(
+        get_embedding_model(), chunks
+    )
+
+    index = create_faiss_index(embeddings)
+
+    return documents, chunks, index
+
+
+# =========================================================
+# Sidebar
+# =========================================================
+
+all_documents = sorted(
+    p.name for p in documents_directory.glob(documents_pattern)
+)
 
 with st.sidebar:
 
@@ -87,7 +136,7 @@ with st.sidebar:
         value=min(chunk_overlap, chunk_size_selected),
         step=50,
     )
-    
+
     top_k_selected = st.slider(
         "Number of chunks to retrieve",
         min_value=1,
@@ -103,81 +152,21 @@ with st.sidebar:
         step=0.1,
     )
 
+    st.divider()
 
-# =========================================================
-# Initialize RAG
-# =========================================================
+    st.subheader("Corpus")
 
-@st.cache_resource
-def initialize_rag():
-
-    # -----------------------------------------------------
-    # 1. Load documents
-    # -----------------------------------------------------
-
-    documents = load_documents(
-        documents_directory,
-        documents_pattern,
+    selected_documents = st.multiselect(
+        "Documents to include",
+        options=all_documents,
+        default=all_documents,
     )
 
-    # -----------------------------------------------------
-    # 2. Create chunks
-    # -----------------------------------------------------
-
-    chunks = create_chunks(
-        documents,
-        chunk_size=chunk_size_selected,
-        overlap=chunk_overlap_selected,
+    st.write(
+        f"**{len(selected_documents)} / {len(all_documents)}" 
+        f" documents selected**"
     )
 
-    # -----------------------------------------------------
-    # 3. Load embedding model
-    # -----------------------------------------------------
-
-    embedding_model = create_embedding_model(
-        embedding_model_name
-    )
-
-    # -----------------------------------------------------
-    # 4. Create document embeddings
-    # -----------------------------------------------------
-
-    embeddings = create_embeddings(embedding_model, chunks)
-
-    # -----------------------------------------------------
-    # 5. Create FAISS index
-    # -----------------------------------------------------
-
-    index = create_faiss_index(
-        embeddings
-    )
-
-    # -----------------------------------------------------
-    # 6. Create LLM client
-    # -----------------------------------------------------
-
-    llm_client = create_llm_client(
-        base_url=base_url,
-        api_key=api_key,
-    )
-
-    return {
-        "documents": documents,
-        "chunks": chunks,
-        "embedding_model": embedding_model,
-        "index": index,
-        "llm_client": llm_client,
-    }
-
-
-rag = initialize_rag()
-
-
-# =========================================================
-# Sidebar II
-# =========================================================
-
-with st.sidebar:
     st.divider()
 
     st.write(
@@ -185,30 +174,93 @@ with st.sidebar:
         f"`{embedding_model_name}`"
     )
 
-    st.write(
-        f"**LLM:** "
-        f"`{llm_model_name}`"
-    )
+    llm_client = get_llm_client()
 
-    st.write(
-        f"**Documents:** "
-        f"{len(rag['documents'])}"
-    )
+    available_models = [
+        model.id for model in llm_client.models.list().data
+    ]
 
-    st.write(
-        f"**Chunks:** "
-        f"{len(rag['chunks'])}"
+    llm_model_selected = st.selectbox(
+        "LLM Model",
+        options=available_models,
+        index=available_models.index(llm_model_name)
+            if llm_model_name in available_models
+            else 0,
     )
 
     st.divider()
-    
-    st.subheader("Documents")
-    
-    for document in rag["documents"]:
 
-        st.write(
-            f"📄 {document['source']}"
-        )
+    st.subheader("System Prompt")
+
+    default_system_prompt = """You are a corporate travel policy assistant.
+Answer the user's question using ONLY the information
+contained in the context below.
+
+IMPORTANT RULES:
+1. If the retrieved documents contain conflicting information
+   (e.g. different numbers, different limits, or different rules
+   for the same topic), you MUST:
+   - Explicitly state that the documents contain conflicting
+     information.
+   - Present BOTH (or all) versions clearly.
+   - Attribute each version to its source document.
+   - Do NOT silently choose one over the other.
+   - Recommend that the user contact the Travel & Expense team
+     for clarification.
+
+2. If the answer cannot be found in the context, say:
+   "I don't know based on the provided documents."
+
+3. Do not invent information."""
+
+    system_prompt = st.text_area(
+        "Edit the system prompt to add constraints",
+        value=default_system_prompt,
+        height=300,
+        key="system_prompt",
+    )
+
+    with st.expander("Prompt constraint examples"):
+        st.markdown("""
+**Ignore personal travel reports:**
+```
+IMPORTANT: Ignore any documents that are personal travel
+reports, personal accounts, or contain personal information
+about specific individuals. Only use official corporate
+policy documents and procedural guides.
+```
+
+**Prefer the most recent document:**
+```
+If two documents conflict, prefer the one that is explicitly
+marked as an update or supplement.
+```
+
+**Escalate on conflict:**
+```
+If the documents contain contradictory information, do not
+attempt to resolve it. Tell the user that conflicting
+information was found and they should contact the Travel
+& Expense team.
+```
+""")
+
+
+# =========================================================
+# Build index based on selection
+# =========================================================
+
+if not selected_documents:
+    st.warning("Select at least one document to use the assistant.")
+    st.stop()
+
+documents, chunks, index = build_index(
+    tuple(selected_documents),
+    chunk_size_selected,
+    chunk_overlap_selected,
+)
+
+embedding_model = get_embedding_model()
 
 
 # =========================================================
@@ -218,8 +270,7 @@ with st.sidebar:
 question = st.text_input(
     "Ask a question about business travel",
     placeholder=(
-        "e.g. Which hotels can I book "
-        "without manager approval?"
+        "e.g. What is the maximum meal allowance?"
     ),
 )
 
@@ -240,30 +291,71 @@ if question:
 
             results = retrieve(
                 question=question,
-                embedding_model=rag["embedding_model"],
-                index=rag["index"],
-                chunks=rag["chunks"],
+                embedding_model=embedding_model,
+                index=index,
+                chunks=chunks,
                 top_k=top_k_selected,
             )
 
             # -------------------------------------------------
-            # Generate answer
+            # Generate answer with conflict-aware prompt
             # -------------------------------------------------
 
-            answer = generate_answer(
-                question=question,
-                results=results,
-                client=rag["llm_client"],
-                model=llm_model_name,
+            context = "\n\n".join(
+                f"[Source: {result['source']}]\n"
+                f"{result['text']}"
+                for result in results
+            )
+
+            prompt = f"""You are a corporate travel policy assistant.
+Answer the user's question using ONLY the information
+contained in the context below.
+
+IMPORTANT RULES:
+1. If the retrieved documents contain conflicting information
+   (e.g. different numbers, different limits, or different rules
+   for the same topic), you MUST:
+   - Explicitly state that the documents contain conflicting
+     information.
+   - Present BOTH (or all) versions clearly.
+   - Attribute each version to its source document.
+   - Do NOT silently choose one over the other.
+   - Recommend that the user contact the Travel & Expense team
+     for clarification.
+
+2. If the answer cannot be found in the context, say:
+   "I don't know based on the provided documents."
+
+3. Do not invent information.
+
+Context:
+----------------
+{context}
+----------------
+
+Question:
+{question}
+"""
+
+            response = llm_client.chat.completions.create(
+                model=llm_model_selected,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": full_prompt,
+                    }
+                ],
                 temperature=temperature_selected,
             )
+
+            answer = response.choices[0].message.content
 
         except Exception as e:
 
             st.error(
                 "Something went wrong. "
                 "Make sure LM Studio is running "
-                "and the Qwen model is loaded."
+                "and the model is loaded."
             )
 
             st.exception(e)
@@ -323,12 +415,14 @@ else:
     )
 
     example_questions = [
-        "How much can a hotel cost?",
-        "What is the maximum meal allowance?",
-        "Which hotels are available in Amsterdam?",
-        "Which hotels can I book without manager approval?",
-        "Can I travel in business class?",
-        "Does the Canal View Hotel have a swimming pool?",
+        "What is the maximum hotel rate I can book without manager approval?",
+        "Do I need manager approval to book the Central Paris Hotel?",
+        "What is the maximum daily meal allowance?",
+        "After how many hours of flight can I book business class?",
+        "How many checked bags does the company reimburse?",
+        "How many days do I have to submit my expense claim?",
+        "What is the tip limit at restaurants?",
+        "What is the fare difference cap for choosing a nonstop flight?",
     ]
 
     for example in example_questions:
